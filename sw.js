@@ -1,5 +1,5 @@
 /* Service worker – makes the app open offline and hands calendar files to the iPhone calendar. */
-const V = 'mw-v2';
+const V = 'mw-v3';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 
 self.addEventListener('install', e => {

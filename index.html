@@ -575,8 +575,31 @@ const sortTasks = l => l.slice().sort((a, b) => (a.due || '9999') < (b.due || '9
 
 /* ========== render root ========== */
 const app = $('#app');
+/* invite code – only a fingerprint (hash) of the code is stored here, never the code itself */
+const INVITE_HASH = 'c78e962e1d534f0bdd1892702b8a305576b0a6fdf27ec9620c1919113e982d9a';
+async function inviteHash(code) {
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('my-wedding-invite:' + code));
+  return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+function renderInvite() {
+  app.dataset.mode = 'invite';
+  app.innerHTML = `<div class="ob">
+    <img class="logo" src="icons/icon-180.png" alt="">
+    <h1>החתונה שלי</h1>
+    <p class="sub">האפליקציה הזאת פרטית.<br>כדי להתחיל צריך קוד הזמנה.</p>
+    <form data-form="invite">
+      <div class="field"><label>קוד הזמנה</label><input name="code" inputmode="numeric" autocomplete="off" maxlength="12" style="text-align:center;font-size:24px;letter-spacing:6px;direction:ltr"></div>
+      <div class="btn-col"><button class="btn" type="submit">כניסה</button></div>
+    </form>
+    <div style="text-align:center;margin-top:18px"><label class="link file-btn">יש לי קובץ גיבוי – שחזור<input type="file" accept=".json,application/json" data-change="restore"></label></div>
+  </div>`;
+}
 function render() {
-  if (!D.settings) return (isMobile && !isStandalone() && !S.skipInstall) ? renderInstall() : renderOnboard();
+  if (!D.settings) {
+    if (isMobile && !isStandalone() && !S.skipInstall) return renderInstall();
+    if (!S.invited) return renderInvite();
+    return renderOnboard();
+  }
   if (S.locked) return renderPin();
   renderMain();
 }
@@ -1145,6 +1168,13 @@ const ACT = {
   },
 };
 const FORMS = {
+  invite: async f => {
+    const code = f.code.value.replace(/\D/g, '');
+    if (!code) return toast('הזיני את קוד ההזמנה');
+    let ok = false; try { ok = (await inviteHash(code)) === INVITE_HASH; } catch (e) {}
+    if (!ok) { f.code.value = ''; toast('הקוד לא נכון'); return; }
+    S.invited = true; await DB.put('kv', 'invited', true); render();
+  },
   onboard: f => {
     const b = f.bride.value.trim(), g = f.groom.value.trim(), d = f.date.value;
     if (!b || !g || !d) return toast('צריך למלא את כל הפרטים');
@@ -1191,7 +1221,7 @@ document.addEventListener('visibilitychange', () => {
 
 /* ========== start ========== */
 (async function start() {
-  try { await DB.open(); const d = await DB.get('kv', 'data'); if (d) D = Object.assign(blank(), d); }
+  try { await DB.open(); const d = await DB.get('kv', 'data'); if (d) D = Object.assign(blank(), d); S.invited = !!(await DB.get('kv', 'invited')); }
   catch (e) { app.innerHTML = '<div class="empty" style="padding-top:80px">לא ניתן לפתוח את האחסון במכשיר.<br>אם את במצב גלישה פרטית – יש לפתוח בחלון רגיל.</div>'; return; }
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
   if (window.caches) caches.delete('ics-v1').catch(() => {});
