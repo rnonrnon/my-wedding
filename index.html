@@ -229,6 +229,14 @@ h2.sec{font-size:17px;margin:22px 2px 10px;font-weight:700}
 .confirm-box p{margin:0 0 18px;font-size:16px;line-height:1.5;text-align:center}
 .viewer{position:fixed;inset:0;z-index:85;background:rgba(0,0,0,.92);display:grid;place-items:center;padding:20px}
 .viewer img{max-width:100%;max-height:100%;border-radius:8px}
+.warn-strong{background:#FDECEC;border:1.5px solid #E7A9AD;color:#8A3B42;border-radius:14px;padding:12px 14px;font-size:14.5px;line-height:1.6;margin:4px 0 10px}
+.check-row{display:flex;gap:10px;align-items:center;font-size:15px;margin:6px 2px 16px}
+.check-row input{width:22px;height:22px;flex:none;accent-color:var(--rose-d)}
+.q-box{background:var(--card);border-radius:14px;padding:14px;text-align:center;font-weight:600;font-size:16px;margin-bottom:14px;box-shadow:var(--shadow)}
+.key:disabled{opacity:.35}
+#cover{position:fixed;inset:0;z-index:300;display:none;place-items:center;background:linear-gradient(170deg,#F3D9D8 0%,#FBF6F1 60%)}
+#cover img{width:96px;height:96px;border-radius:26px;box-shadow:0 6px 20px rgba(167,99,108,.25)}
+body.covered #cover{display:grid}
 .foot-note{text-align:center;font-size:12.5px;color:var(--muted);margin-top:20px}
 </style>
 </head>
@@ -236,6 +244,7 @@ h2.sec{font-size:17px;margin:22px 2px 10px;font-weight:700}
 <div id="app"></div>
 <div id="sheet-root"></div>
 <div id="toast"></div>
+<div id="cover"><img src="icons/icon-180.png" alt=""></div>
 
 <script>
 'use strict';
@@ -541,28 +550,131 @@ function addGuestNames(names) {
   save(); return n;
 }
 
-/* ========== backup / restore ========== */
-async function doBackup() {
-  const photos = {}; for (const [k, v] of await DB.entries('photos')) photos[k] = v;
-  const json = JSON.stringify({app: 'my-wedding', v: 1, exportedAt: new Date().toISOString(), data: D, photos});
-  const file = new File([json], `my-wedding-backup-${todayISO()}.json`, {type: 'application/json'});
-  let ok = false;
-  if (navigator.canShare && navigator.canShare({files: [file]})) {
-    try { await navigator.share({files: [file], title: 'גיבוי – החתונה שלי'}); ok = true; }
-    catch (e) { if (e.name === 'AbortError') return; }
+/* ========== crypto helpers ========== */
+const te = new TextEncoder();
+const toHex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0')).join('');
+const hexToBytes = h => new Uint8Array((h.match(/../g) || []).map(x => parseInt(x, 16)));
+const randBytes = n => crypto.getRandomValues(new Uint8Array(n));
+const randHex = n => toHex(randBytes(n));
+const toB64 = u8 => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
+const fromB64 = b => { const s = atob(b); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; };
+async function pbkdf2Hex(pass, saltHex, iter) {
+  const base = await crypto.subtle.importKey('raw', te.encode(pass), 'PBKDF2', false, ['deriveBits']);
+  return toHex(new Uint8Array(await crypto.subtle.deriveBits({name: 'PBKDF2', salt: hexToBytes(saltHex), iterations: iter, hash: 'SHA-256'}, base, 256)));
+}
+async function aesKey(pass, salt, iter) {
+  const base = await crypto.subtle.importKey('raw', te.encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256'}, base, {name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']);
+}
+/* answer to the secret question: ignore case, niqqud, punctuation and extra spaces */
+const normAnswer = a => String(a || '').toLowerCase().replace(/[֑-ׇ]/g, '').replace(/["'״׳.,!?־\-]/g, '').replace(/\s+/g, ' ').trim();
+
+/* ========== too many wrong tries → wait ========== */
+let G = {fails: 0, until: 0};
+const WAIT_STEPS = [30, 60, 300, 900];
+const guardLeft = () => Math.max(0, (G.until || 0) - Date.now());
+async function guardFail() { G.fails = (G.fails || 0) + 1; if (G.fails >= 5) G.until = Date.now() + WAIT_STEPS[Math.min(G.fails - 5, 3)] * 1000; await DB.put('kv', 'guard', G); }
+async function guardReset() { G = {fails: 0, until: 0}; await DB.put('kv', 'guard', G); }
+const mmss = ms => { const t = Math.ceil(ms / 1000); return `${Math.floor(t / 60)}:${pad(t % 60)}`; };
+let guardTimer = null;
+function ensureGuardTimer() {
+  if (guardTimer || !guardLeft()) return;
+  guardTimer = setInterval(() => {
+    if (app.dataset.mode === 'pin') renderPin();
+    if (!guardLeft()) { clearInterval(guardTimer); guardTimer = null; if (app.dataset.mode === 'pin') renderPin(); }
+  }, 1000);
+}
+
+/* ========== restore safety: keep only known fields of the right type ========== */
+function cleanData(x) {
+  x = x && typeof x === 'object' ? x : {};
+  const str = (v, m = 1000) => v == null ? '' : String(v).slice(0, m);
+  const num = v => { const n = Number(v); return isFinite(n) ? n : 0; };
+  const bool = v => v === true;
+  const date = v => /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : '';
+  const time = v => /^\d{2}:\d{2}$/.test(v) ? v : '';
+  const id = v => typeof v === 'string' && /^[a-z0-9]{1,40}$/i.test(v) ? v : uid();
+  const ref = v => typeof v === 'string' && /^[a-z0-9]{1,40}$/i.test(v) ? v : null;
+  const alert = v => ALERTS.some(a => a[0] === Number(v)) ? Number(v) : -1;
+  const arr = (v, f) => Array.isArray(v) ? v.filter(o => o && typeof o === 'object').map(f) : [];
+  const hex = v => typeof v === 'string' && /^[0-9a-fx-]{1,128}$/i.test(v) ? v : '';
+  const st = x.settings && typeof x.settings === 'object' ? x.settings : null;
+  let settings = null;
+  if (st && date(st.date) && hex(st.pinHash)) {
+    settings = {bride: str(st.bride, 80), groom: str(st.groom, 80), date: st.date, salt: /^[a-z0-9]{1,64}$/i.test(st.salt) ? st.salt : '', pinHash: st.pinHash, created: num(st.created)};
+    const r = st.recovery;
+    if (r && typeof r === 'object' && hex(r.salt) && hex(r.hash) && num(r.iter) >= 10000 && num(r.iter) <= 2000000)
+      settings.recovery = {q: str(r.q, 200), salt: r.salt, hash: r.hash, iter: num(r.iter)};
   }
-  if (!ok) { const u = URL.createObjectURL(file); const a = document.createElement('a'); a.href = u; a.download = file.name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(u), 60000); ok = true; }
-  D.lastBackup = Date.now(); await saveNow(); toast('הגיבוי נשמר ✓'); if (D.settings && !S.locked) renderMain();
+  return Object.assign(blank(), {
+    settings,
+    expenses: arr(x.expenses, e => ({id: id(e.id), amount: num(e.amount), title: str(e.title, 200), cat: str(e.cat, 60), payer: PAYERS.includes(e.payer) ? e.payer : '', date: date(e.date), note: str(e.note), vendorId: ref(e.vendorId), photo: ref(e.photo), created: num(e.created)})),
+    vendors: arr(x.vendors, v => ({id: id(v.id), name: str(v.name, 200), cat: str(v.cat, 60), phone: str(v.phone, 40), total: num(v.total), note: str(v.note), created: num(v.created)})),
+    appts: arr(x.appts, a => ({id: id(a.id), title: str(a.title, 200), date: date(a.date), time: time(a.time), place: str(a.place, 300), note: str(a.note), alert: alert(a.alert), created: num(a.created)})),
+    tasks: arr(x.tasks, t => ({id: id(t.id), title: str(t.title, 300), done: bool(t.done), doneAt: t.doneAt ? num(t.doneAt) : null, due: date(t.due), time: time(t.time), note: str(t.note), alert: alert(t.alert), created: num(t.created)})),
+    guests: arr(x.guests, g => ({id: id(g.id), name: str(g.name, 200), count: Math.min(99, Math.max(1, Math.round(num(g.count)) || 1)), invited: bool(g.invited), confirmed: bool(g.confirmed)})),
+    gifts: arr(x.gifts, g => ({id: id(g.id), name: str(g.name, 200), amount: num(g.amount), type: str(g.type, 40), note: str(g.note, 300), created: num(g.created)})),
+    lastBackup: x.lastBackup ? num(x.lastBackup) : null,
+  });
+}
+const goodPhoto = v => typeof v === 'string' && v.length < 15e6 && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+=*$/.test(v);
+
+/* ========== backup / restore ========== */
+const BACKUP_ITER = 250000;
+function backupSheet() {
+  openSheet(`<h3>גיבוי נעול בסיסמה 🔒</h3>
+    <p class="hint" style="margin:0 2px 14px">רק מי שיודע את הסיסמה יוכל לפתוח את קובץ הגיבוי.</p>
+    <div class="field"><label>סיסמה לגיבוי (לפחות 6 תווים)</label><input type="password" name="bp1" autocomplete="new-password"></div>
+    <div class="field"><label>הסיסמה שוב</label><input type="password" name="bp2" autocomplete="new-password"></div>
+    <div class="warn-strong">⚠️ <b>שמרי את הסיסמה הזאת!</b><br>בלי הסיסמה אי אפשר לפתוח את הגיבוי. גם אף אחד אחר לא יוכל לעזור.<br>כדאי לרשום אותה בפתקים או במקום בטוח אחר.</div>
+    <label class="check-row"><input type="checkbox" name="bsaved"> שמרתי את הסיסמה במקום בטוח</label>
+    <button class="btn" data-act="backupMake">${I.lock} יצירת גיבוי</button>`);
+}
+async function makeBackupFile(pass) {
+  const photos = {}; for (const [k, v] of await DB.entries('photos')) photos[k] = v;
+  const plain = te.encode(JSON.stringify({app: 'my-wedding', v: 1, data: D, photos}));
+  const salt = randBytes(16), iv = randBytes(12);
+  const ct = await crypto.subtle.encrypt({name: 'AES-GCM', iv}, await aesKey(pass, salt, BACKUP_ITER), plain);
+  const json = JSON.stringify({app: 'my-wedding', v: 2, enc: {alg: 'AES-GCM', kdf: 'PBKDF2-SHA256', iter: BACKUP_ITER, salt: toB64(salt), iv: toB64(iv)}, payload: toB64(new Uint8Array(ct))});
+  return new File([json], `my-wedding-backup-${todayISO()}.json`, {type: 'application/json'});
+}
+async function backupDone() { D.lastBackup = Date.now(); await saveNow(); S.backupFile = null; closeSheet(); toast('הגיבוי נשמר ✓'); if (D.settings && !S.locked && app.dataset.mode === 'main') renderMain(); }
+function backupSave() {   // called straight from the tap, so the iPhone share sheet is allowed to open
+  const file = S.backupFile; if (!file) return;
+  if (navigator.canShare && navigator.canShare({files: [file]})) {
+    navigator.share({files: [file], title: 'גיבוי – החתונה שלי'}).then(backupDone).catch(e => { if (e.name !== 'AbortError') toast('השמירה נכשלה, נסי שוב'); });
+    return;
+  }
+  const u = URL.createObjectURL(file); const a = document.createElement('a'); a.href = u; a.download = file.name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(u), 60000);
+  backupDone();
+}
+async function decryptBackup(p, pass) {
+  const e = p.enc, iter = Number(e.iter);
+  if (e.alg !== 'AES-GCM' || !(iter >= 100000 && iter <= 2000000)) throw new Error('bad');
+  const pt = await crypto.subtle.decrypt({name: 'AES-GCM', iv: fromB64(e.iv)}, await aesKey(pass, fromB64(e.salt), iter), fromB64(p.payload));
+  return JSON.parse(new TextDecoder().decode(pt));
 }
 async function doRestore(file) {
-  try {
-    const p = JSON.parse(await file.text());
-    if (p.app !== 'my-wedding' || !p.data || !p.data.settings) throw new Error('bad');
-    if (D.settings && !(await confirmBox('השחזור יחליף את כל הנתונים שכרגע באפליקציה. להמשיך?', 'שחזור', false))) return;
-    D = Object.assign(blank(), p.data); await saveNow();
-    await DB.clear('photos'); for (const [k, v] of Object.entries(p.photos || {})) await DB.put('photos', k, v);
-    closeSheet(); S.locked = true; S.pin = {mode: 'unlock', ctx: null, buf: '', first: ''}; render(); toast('השחזור הצליח ✓ הקלידי את הקוד');
-  } catch (e) { toast('הקובץ לא תקין – צריך קובץ גיבוי של האפליקציה'); }
+  let p; try { p = JSON.parse(await file.text()); } catch (e) { p = null; }
+  if (!p || p.app !== 'my-wedding') return toast('הקובץ לא תקין – צריך קובץ גיבוי של האפליקציה');
+  if (p.enc) {
+    S.restoreFile = p;
+    return openSheet(`<h3>שחזור מגיבוי 🔒</h3>
+      <div class="field"><label>הסיסמה של הגיבוי</label><input type="password" name="rp" autocomplete="current-password"></div>
+      <button class="btn" data-act="restoreUnlock">שחזור</button>`);
+  }
+  applyRestore(p);   // older backup without a password
+}
+async function applyRestore(p) {
+  const data = cleanData(p.data);
+  if (!data.settings) return toast('הקובץ לא תקין – צריך קובץ גיבוי של האפליקציה');
+  if (D.settings && !(await confirmBox('השחזור יחליף את כל הנתונים שכרגע באפליקציה. להמשיך?', 'שחזור', false))) return;
+  const photos = Object.entries(p.photos && typeof p.photos === 'object' ? p.photos : {}).filter(([k, v]) => /^[a-z0-9]{1,40}$/i.test(k) && goodPhoto(v));
+  const keep = new Set(photos.map(([k]) => k)); data.expenses.forEach(e => { if (e.photo && !keep.has(e.photo)) e.photo = null; });
+  D = data; await saveNow();
+  await DB.clear('photos'); for (const [k, v] of photos) await DB.put('photos', k, v);
+  S.invited = true; await DB.put('kv', 'invited', true);
+  S.restoreFile = null; closeSheet(); S.locked = true; S.pin = {mode: 'unlock', ctx: null, buf: '', first: ''}; render(); toast('השחזור הצליח ✓ הקלידי את הקוד');
 }
 
 /* ========== data queries ========== */
@@ -601,7 +713,29 @@ function render() {
     return renderOnboard();
   }
   if (S.locked) return renderPin();
+  if (!D.settings.recovery || S.recoveryCtx === 'change') return renderRecovery();
   renderMain();
+}
+
+/* ----- secret question (for a forgotten code) ----- */
+const RECOVERY_QS = ['איך קראו לחיית המחמד הראשונה שלי?', 'באיזה רחוב גרתי בילדות?', 'מה השם של המורה האהובה עליי?', 'מה השם של החברה הכי טובה שלי בגן?', 'מה המאכל שהכי אהבתי אצל סבתא?'];
+function renderRecovery() {
+  app.dataset.mode = 'recovery';
+  const change = S.recoveryCtx === 'change';
+  app.innerHTML = `<div class="ob">
+    <img class="logo" src="icons/icon-180.png" alt="">
+    <h1>שאלה סודית 🔑</h1>
+    <p class="sub">${change ? 'בחרי שאלה סודית חדשה.' : 'עוד צעד קטן לביטחון שלך.'}<br>אם תשכחי את הקוד, תעני על השאלה הזאת כדי לבחור קוד חדש.<br><b>בחרי שאלה שרק את יודעת את התשובה עליה.</b></p>
+    <form data-form="recovery">
+      <div class="field"><label>השאלה</label><select name="q" data-change="recQ">${RECOVERY_QS.map(q => `<option>${esc(q)}</option>`).join('')}<option value="custom">שאלה משלי…</option></select></div>
+      <div class="field" id="qcWrap" style="display:none"><label>השאלה שלי</label><input name="qc" autocomplete="off" placeholder="כתבי שאלה"></div>
+      <div class="field"><label>התשובה</label><input name="a1" autocomplete="off"></div>
+      <div class="field"><label>התשובה שוב</label><input name="a2" autocomplete="off"></div>
+      <p class="hint">לא משנה אם כותבים עם רווחים מיותרים או סימני פיסוק.</p>
+      <div class="btn-col"><button class="btn" type="submit">שמירה</button>
+      ${change ? `<button type="button" class="btn soft" data-act="recCancel">ביטול</button>` : ''}</div>
+    </form>
+  </div>`;
 }
 
 /* ----- install screen ----- */
@@ -645,8 +779,13 @@ function renderPin(shake) {
   app.dataset.mode = 'pin';
   const p = S.pin;
   const title = p.mode === 'unlock' ? 'החתונה שלי' : p.mode === 'create' ? (p.ctx === 'change' ? 'קוד חדש' : 'בחירת קוד') : 'אימות הקוד';
-  const sub = p.mode === 'unlock' ? 'הקלידי את הקוד שלך' : p.mode === 'create' ? 'בחרי קוד של 4 ספרות' : 'הקלידי את הקוד שוב';
-  const k = n => `<button class="key" data-act="key" data-k="${n}">${n}</button>`;
+  const wait = p.mode === 'unlock' ? guardLeft() : 0;
+  const left5 = 5 - (G.fails || 0);
+  const sub = wait ? `יותר מדי ניסיונות. נסי שוב בעוד ${mmss(wait)}`
+    : p.mode === 'unlock' ? ((G.fails || 0) >= 3 && left5 > 0 ? `קוד שגוי. נותרו ${left5} ניסיונות` : 'הקלידי את הקוד שלך')
+    : p.mode === 'create' ? 'בחרי קוד של 4 ספרות' : 'הקלידי את הקוד שוב';
+  if (wait) ensureGuardTimer();
+  const k = n => `<button class="key" data-act="key" data-k="${n}"${wait ? ' disabled' : ''}>${n}</button>`;
   const left = p.mode === 'unlock' ? `<button class="key fn" data-act="forgotPin">שכחתי</button>`
     : p.ctx === 'change' ? `<button class="key fn" data-act="pinCancel">ביטול</button>` : `<span></span>`;
   app.innerHTML = `<div class="lock">
@@ -659,24 +798,25 @@ async function pinKey(kv) {
   const p = S.pin;
   if (kv === 'del') { p.buf = p.buf.slice(0, -1); return renderPin(); }
   if (p.buf.length >= 4) return;
+  if (p.mode === 'unlock' && guardLeft()) return;
   p.buf += kv; renderPin();
   if (p.buf.length < 4) return;
   await new Promise(r => setTimeout(r, 120));
   if (p.mode === 'unlock') {
     const h = await hashPin(p.buf, D.settings.salt);
-    if (h === D.settings.pinHash) { S.locked = false; p.buf = ''; S.lastTab = null; render(); }
-    else { p.buf = ''; renderPin(true); if (navigator.vibrate) navigator.vibrate(120); }
+    if (h === D.settings.pinHash) { await guardReset(); S.locked = false; p.buf = ''; S.lastTab = null; render(); }
+    else { await guardFail(); p.buf = ''; renderPin(true); if (navigator.vibrate) navigator.vibrate(120); }
   } else if (p.mode === 'create') { p.first = p.buf; p.buf = ''; p.mode = 'confirm'; renderPin(); }
   else if (p.mode === 'confirm') {
     if (p.buf !== p.first) { p.buf = ''; p.first = ''; p.mode = 'create'; renderPin(true); toast('הקודים לא תאמו – נסי שוב'); return; }
-    const salt = uid(); const pinHash = await hashPin(p.buf, salt);
+    const salt = randHex(16); const pinHash = await hashPin(p.buf, salt);
     if (p.ctx === 'onboard') {
       D.settings = {bride: S.ob.bride.trim(), groom: S.ob.groom.trim(), date: S.ob.date, salt, pinHash, created: Date.now()};
       if (!D.tasks.length) D.tasks = [];
     } else { D.settings.salt = salt; D.settings.pinHash = pinHash; }
     await saveNow();
     const ctx = p.ctx; S.pin = {mode: 'unlock', ctx: null, buf: '', first: ''}; S.locked = false; S.lastTab = null; render();
-    toast(ctx === 'onboard' ? 'הכול מוכן! מזל טוב 💍' : 'הקוד עודכן ✓');
+    if (ctx !== 'onboard') { await guardReset(); toast('הקוד עודכן ✓'); }
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   }
 }
@@ -864,7 +1004,7 @@ function giftSheet(g) {
   openSheet(`<h3>${isNew ? 'מתנה חדשה' : 'עריכת מתנה'}</h3>
     <div class="field"><label>ממי?</label><input name="name" list="guestnames" value="${esc(g.name || '')}" placeholder="שם הנותנים" autocomplete="off">
       <datalist id="guestnames">${names.map(n => `<option value="${esc(n)}">`).join('')}</datalist></div>
-    <div class="field"><label>סכום (₪)</label><input name="amount" inputmode="decimal" value="${g.amount ?? ''}" placeholder="0"></div>
+    <div class="field"><label>סכום (₪)</label><input name="amount" inputmode="decimal" value="${esc(g.amount ?? '')}" placeholder="0"></div>
     <div class="field"><label>סוג</label>${chipsHTML('type', GIFT_TYPES, g.type || '')}</div>
     <div class="field"><label>הערה</label><input name="note" value="${esc(g.note || '')}" placeholder="למשל: סט כלים, מהעבודה של אבא..."></div>
     <div class="btn-col"><button class="btn" data-act="saveGift" data-id="${g.id || ''}">שמירה</button>
@@ -915,7 +1055,7 @@ async function expenseSheet(e, preset) {
   S.sheetPhoto = e.photo ? {id: e.photo, data: await DB.get('photos', e.photo)} : null;
   const vopts = D.vendors.map(v => `<option value="${v.id}" ${e.vendorId === v.id ? 'selected' : ''}>${esc(v.name)}</option>`).join('');
   openSheet(`<h3>${isNew ? 'הוצאה חדשה' : 'עריכת הוצאה'}</h3>
-    <div class="field"><label>סכום (₪)</label><input name="amount" type="text" inputmode="decimal" value="${e.amount ?? ''}" placeholder="0"></div>
+    <div class="field"><label>סכום (₪)</label><input name="amount" type="text" inputmode="decimal" value="${esc(e.amount ?? '')}" placeholder="0"></div>
     <div class="field"><label>על מה?</label><input name="title" value="${esc(e.title || '')}" placeholder="למשל: מקדמה לאולם"></div>
     <div class="field"><label>קטגוריה</label>${chipsHTML('cat', EXP_CATS, e.cat || '')}</div>
     <div class="field"><label>מי משלם</label>${chipsHTML('payer', PAYERS.map(k => [k, payerLabel(k)]), e.payer || '')}</div>
@@ -929,7 +1069,7 @@ async function expenseSheet(e, preset) {
 function photoBoxHTML() {
   const p = S.sheetPhoto;
   return p && p.data
-    ? `<img src="${p.data}" data-act="viewPhoto" alt="קבלה"><button type="button" class="btn small soft" data-act="removePhoto">הסרה</button>`
+    ? `<img src="${esc(p.data)}" data-act="viewPhoto" alt="קבלה"><button type="button" class="btn small soft" data-act="removePhoto">הסרה</button>`
     : `<label class="btn small soft file-btn">${I.clip} צירוף תמונה<input type="file" accept="image/*" data-change="photo"></label>`;
 }
 function vendorSheet(v) {
@@ -939,7 +1079,7 @@ function vendorSheet(v) {
     <div class="field"><label>שם הספק</label><input name="name" value="${esc(v.name || '')}" placeholder="למשל: אולמי הגן"></div>
     <div class="field"><label>קטגוריה</label>${chipsHTML('cat', EXP_CATS, v.cat || '')}</div>
     <div class="two"><div class="field"><label>טלפון</label><input name="phone" type="tel" inputmode="tel" value="${esc(v.phone || '')}" placeholder="050-0000000"></div>
-      <div class="field"><label>מחיר כולל (₪)</label><input name="total" inputmode="decimal" value="${v.total ?? ''}" placeholder="0"></div></div>
+      <div class="field"><label>מחיר כולל (₪)</label><input name="total" inputmode="decimal" value="${esc(v.total ?? '')}" placeholder="0"></div></div>
     <div class="field"><label>הערות</label><textarea name="note" placeholder="מה כלול, תנאים...">${esc(v.note || '')}</textarea></div>
     ${pays.length ? `<div class="field"><label>תשלומים</label><div class="card pay-list">${pays.map(p => `<div class="kv"><span>${p.date ? fmt(p.date, {day: 'numeric', month: 'short'}) : ''} · ${esc(p.title || '')}</span><b>${money(p.amount)}</b></div>`).join('')}</div></div>` : ''}
     <div class="btn-col"><button class="btn" data-act="saveVendor" data-id="${v.id || ''}">שמירה</button>
@@ -1001,11 +1141,12 @@ function settingsSheet() {
     <button class="btn" data-act="saveSettings">שמירת פרטים</button>
     <h2 class="sec">גיבוי ושחזור</h2>
     <div class="card"><p class="hint" style="margin-top:0">${D.lastBackup ? 'גיבוי אחרון: ' + new Date(D.lastBackup).toLocaleDateString('he-IL') : 'עוד לא בוצע גיבוי'}.<br>
-      שומרים את קובץ הגיבוי ב"קבצים" או שולחים אותו לעצמך בוואטסאפ / מייל. כך אפשר לשחזר הכול גם בטלפון חדש.</p>
+      הגיבוי נעול בסיסמה שאת בוחרת. שומרים את הקובץ ב"קבצים" או ב-iCloud, וכך אפשר לשחזר הכול גם בטלפון חדש.</p>
       <div class="btn-col" style="margin-top:12px"><button class="btn" data-act="backup">${I.share} גיבוי עכשיו</button>
       <label class="btn soft file-btn">${I.upload} שחזור מקובץ גיבוי<input type="file" accept=".json,application/json" data-change="restore"></label></div></div>
     <h2 class="sec">אבטחה</h2>
     <div class="btn-col" style="margin-top:0"><button class="btn soft" data-act="changePin">${I.lock} שינוי קוד כניסה</button>
+      <button class="btn soft" data-act="changeRecovery">🔑 שינוי שאלה סודית</button>
       <button class="btn soft" data-act="lockNow">נעילה עכשיו</button>
       ${isStandalone() ? '' : `<button class="btn soft" data-act="installHelp">איך מתקינים במסך הבית</button>`}
       <button class="btn danger" data-act="wipe">מחיקת כל הנתונים</button></div>
@@ -1028,12 +1169,49 @@ const ACT = {
   key: el => pinKey(el.dataset.k),
   skipInstall: () => { S.skipInstall = true; render(); },
   pinCancel: () => { S.pin = {mode: 'unlock', ctx: null, buf: '', first: ''}; S.locked = false; S.lastTab = null; render(); },
-  forgotPin: () => openSheet(`<h3>שכחתי את הקוד</h3><p class="hint" style="text-align:center;margin-bottom:14px">כדי לבחור קוד חדש, הזיני את תאריך החתונה ששמרת באפליקציה.</p>
-    <div class="field"><label>תאריך החתונה</label><input type="date" name="fdate"></div>
-    <button class="btn" data-act="forgotCheck">המשך</button>`),
-  forgotCheck: () => {
-    if (val('fdate') === D.settings.date) { closeSheet(); S.pin = {mode: 'create', ctx: 'reset', buf: '', first: ''}; renderPin(); }
-    else toast('התאריך לא תואם');
+  forgotPin: () => {
+    if (guardLeft()) return toast('צריך לחכות ' + mmss(guardLeft()));
+    const r = D.settings.recovery;
+    if (!r) return openSheet(`<h3>שכחתי את הקוד</h3><p class="hint" style="text-align:center;margin-bottom:14px">עוד לא נבחרה שאלה סודית.<br>אפשר לשחזר הכול מקובץ גיבוי, או למחוק את הנתונים ולהתחיל מחדש.</p>
+      <div class="btn-col"><label class="btn file-btn">${I.upload} שחזור מקובץ גיבוי<input type="file" accept=".json,application/json" data-change="restore"></label>
+      <button class="btn danger" data-act="wipe">מחיקת כל הנתונים</button></div>`);
+    openSheet(`<h3>שכחתי את הקוד</h3><p class="hint" style="text-align:center;margin-bottom:10px">עני על השאלה הסודית שבחרת:</p>
+      <div class="q-box">${esc(r.q)}</div>
+      <div class="field"><label>התשובה</label><input name="fans" autocomplete="off"></div>
+      <button class="btn" data-act="forgotCheck">המשך</button>`);
+  },
+  forgotCheck: async el => {
+    if (guardLeft()) return toast('צריך לחכות ' + mmss(guardLeft()));
+    const r = D.settings.recovery; if (!r) return;
+    el.disabled = true;
+    const ok = (await pbkdf2Hex(normAnswer(val('fans')), r.salt, r.iter)) === r.hash;
+    el.disabled = false;
+    if (ok) { await guardReset(); closeSheet(); S.pin = {mode: 'create', ctx: 'reset', buf: '', first: ''}; renderPin(); }
+    else { await guardFail(); if (guardLeft()) { closeSheet(); renderPin(); } toast('התשובה לא נכונה'); }
+  },
+  changeRecovery: () => { closeSheet(); S.recoveryCtx = 'change'; render(); },
+  recCancel: () => { S.recoveryCtx = null; S.lastTab = null; render(); },
+  backupMake: async el => {
+    const a = val('bp1'), b = $('.sheet [name=bp2]').value;
+    if (a.length < 6) return toast('הסיסמה צריכה לפחות 6 תווים');
+    if ($('.sheet [name=bp1]').value !== b) return toast('הסיסמאות לא זהות');
+    if (!$('.sheet [name=bsaved]').checked) return toast('סמני ✓ שהסיסמה שמורה אצלך');
+    el.disabled = true; el.textContent = 'מכין גיבוי…';
+    try { S.backupFile = await makeBackupFile($('.sheet [name=bp1]').value); }
+    catch (e) { el.disabled = false; el.textContent = 'יצירת גיבוי'; return toast('הגיבוי נכשל'); }
+    openSheet(`<h3>הגיבוי מוכן ✓</h3>
+      <p class="hint" style="text-align:center;margin-bottom:16px">הקובץ נעול בסיסמה שבחרת.<br>עכשיו שמרי אותו: ב"קבצים", ב-iCloud, או שלחי לעצמך.</p>
+      <button class="btn" data-act="backupSave">${I.share} שמירת הקובץ</button>`);
+  },
+  backupSave,
+  restoreUnlock: async el => {
+    const pw = $('.sheet [name=rp]').value; if (!pw || !S.restoreFile) return;
+    el.disabled = true; el.textContent = 'פותח…';
+    let payload;
+    try { payload = await decryptBackup(S.restoreFile, pw); }
+    catch (e) { el.disabled = false; el.textContent = 'שחזור'; return toast('הסיסמה לא נכונה'); }
+    if (!payload || payload.app !== 'my-wedding') return toast('הקובץ לא תקין');
+    applyRestore(payload);
   },
   changePin: () => { closeSheet(); S.pin = {mode: 'create', ctx: 'change', buf: '', first: ''}; S.locked = true; renderPin(); },
   lockNow: () => { closeSheet(); S.locked = true; S.pin = {mode: 'unlock', ctx: null, buf: '', first: ''}; render(); },
@@ -1043,11 +1221,11 @@ const ACT = {
     if (!b || !g || !d) return toast('צריך למלא את כל הפרטים');
     Object.assign(D.settings, {bride: b, groom: g, date: d}); save(); closeSheet(); renderMain(); toast('נשמר ✓');
   },
-  backup: () => doBackup().catch(() => toast('הגיבוי נכשל')),
+  backup: backupSheet,
   wipe: async () => {
     if (!(await confirmBox('למחוק את כל הנתונים מהאפליקציה? אי אפשר לבטל את זה. כדאי לגבות קודם.'))) return;
     if (!(await confirmBox('בטוח? הכול יימחק לצמיתות.', 'כן, למחוק הכול'))) return;
-    D = blank(); await saveNow(); await DB.clear('photos'); closeSheet(); S.locked = true; S.ob = {}; S.tab = 'home'; render();
+    D = blank(); await saveNow(); await DB.clear('photos'); await guardReset(); closeSheet(); S.locked = true; S.ob = {}; S.tab = 'home'; render();
   },
   installHelp: () => openSheet(`<h3>התקנה במסך הבית</h3><div class="steps">${isIOS
     ? `<ol><li>פותחים את הקישור ב<b>ספארי</b></li><li>לוחצים על כפתור השיתוף ${I.iosShare}</li><li>בוחרים <b>"הוסף למסך הבית"</b> ← <b>"הוסף"</b></li></ol>`
@@ -1113,7 +1291,7 @@ const ACT = {
   delExpense: async el => { if (!(await confirmBox('למחוק את ההוצאה?'))) return; const e = byId(D.expenses, el.dataset.id);
     if (e && e.photo) DB.del('photos', e.photo); D.expenses = D.expenses.filter(x => x.id !== el.dataset.id); save(); closeSheet(); renderMain(); },
   removePhoto: () => { S.sheetPhoto = null; $('#photoBox').innerHTML = photoBoxHTML(); },
-  viewPhoto: () => { const p = S.sheetPhoto; if (!p) return; const d = document.createElement('div'); d.className = 'viewer'; d.innerHTML = `<img src="${p.data}" alt="">`; d.onclick = () => d.remove(); document.body.appendChild(d); },
+  viewPhoto: () => { const p = S.sheetPhoto; if (!p) return; const d = document.createElement('div'); d.className = 'viewer'; const im = new Image(); im.src = p.data; d.appendChild(im); d.onclick = () => d.remove(); document.body.appendChild(d); },
   newVendor: () => vendorSheet(null),
   editVendor: el => { const v = byId(D.vendors, el.dataset.id); if (v) vendorSheet(v); },
   saveVendor: el => {
@@ -1168,6 +1346,18 @@ const ACT = {
   },
 };
 const FORMS = {
+  recovery: async f => {
+    const q = f.q.value === 'custom' ? f.qc.value.trim() : f.q.value;
+    if (q.length < 5) return toast('כתבי את השאלה');
+    const a1 = normAnswer(f.a1.value), a2 = normAnswer(f.a2.value);
+    if (a1.length < 2) return toast('כתבי תשובה');
+    if (a1 !== a2) return toast('התשובות לא זהות');
+    const first = !D.settings.recovery; const salt = randHex(16), iter = 200000;
+    const hash = await pbkdf2Hex(a1, salt, iter);
+    D.settings.recovery = {q, salt, hash, iter}; await saveNow();
+    S.recoveryCtx = null; S.lastTab = null; render();
+    toast(first ? 'הכול מוכן! מזל טוב 💍' : 'השאלה הסודית עודכנה ✓');
+  },
   invite: async f => {
     const code = f.code.value.replace(/\D/g, '');
     if (!code) return toast('הזיני את קוד ההזמנה');
@@ -1186,6 +1376,7 @@ const FORMS = {
     D.guests.push({id: uid(), name: o.name, count: o.count, invited: false, confirmed: false}); save(); f.g.value = ''; renderGuestList(); f.g.focus(); },
 };
 const CHANGES = {
+  recQ: el => { $('#qcWrap').style.display = el.value === 'custom' ? '' : 'none'; },
   restore: inp => { const f = inp.files[0]; if (f) doRestore(f); inp.value = ''; },
   photo: async inp => { const f = inp.files[0]; if (!f) return; try { S.sheetPhoto = {id: null, data: await compressImage(f)}; $('#photoBox').innerHTML = photoBoxHTML(); } catch (e) { toast('לא הצלחתי לפתוח את התמונה'); } },
   importFile: async inp => {
@@ -1210,9 +1401,17 @@ document.addEventListener('input', e => {
     $('#giftlist').innerHTML = giftRows(D.gifts.filter(g => !q || g.name.includes(q)).sort((a, b) => (b.created || 0) - (a.created || 0)), D.gifts.length); }
 });
 
+/* hide the content while the app is in the background (app switcher picture) */
+const cover = on => { if (on && !D.settings) return; document.body.classList.toggle('covered', on); };
+window.addEventListener('blur', () => cover(true));
+window.addEventListener('pagehide', () => cover(true));
+window.addEventListener('focus', () => cover(false));
+$('#cover').addEventListener('pointerdown', () => cover(false));
+
 /* auto-lock after 1 minute in background */
 let hiddenAt = 0;
 document.addEventListener('visibilitychange', () => {
+  cover(document.hidden);
   if (document.hidden) hiddenAt = Date.now();
   else if (D.settings && !S.locked && hiddenAt && Date.now() - hiddenAt > 60000) {
     closeSheet(); S.locked = true; S.pin = {mode: 'unlock', ctx: null, buf: '', first: ''}; render();
@@ -1221,7 +1420,9 @@ document.addEventListener('visibilitychange', () => {
 
 /* ========== start ========== */
 (async function start() {
-  try { await DB.open(); const d = await DB.get('kv', 'data'); if (d) D = Object.assign(blank(), d); S.invited = !!(await DB.get('kv', 'invited')); }
+  try { await DB.open(); const d = await DB.get('kv', 'data'); if (d) D = Object.assign(blank(), d); S.invited = !!(await DB.get('kv', 'invited'));
+    const g = await DB.get('kv', 'guard'); if (g) G = g;
+    if (D.settings && !S.invited) { S.invited = true; await DB.put('kv', 'invited', true); } }
   catch (e) { app.innerHTML = '<div class="empty" style="padding-top:80px">לא ניתן לפתוח את האחסון במכשיר.<br>אם את במצב גלישה פרטית – יש לפתוח בחלון רגיל.</div>'; return; }
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
   if (window.caches) caches.delete('ics-v1').catch(() => {});
